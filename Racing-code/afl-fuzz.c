@@ -4535,6 +4535,151 @@ static void check_map_coverage(void) {
   WARNF("Recompile binary with newer version of afl to improve coverage!");
 }
 
+
+// ===================================================================
+// START OF ANAYZE ONCE MODE
+// ===================================================================
+
+// 1. 定义一个临时存储断言实例的结构体
+struct predicate_instance {
+  u32 id;
+  u8  is_inst; // 1 for instruction, 0 for basic block
+  enum Predicate type;
+  u64 boundary;
+};
+
+/*
+  纯粹的特征提取器。
+  遍历一次崩溃轨迹的原始数据 (current_trace)，
+  生成所有被触发的断言。
+  不进行任何评分、筛选或差分分析。
+*/
+static u32 generate_all_predicates_from_trace(
+    struct exec_info* current_trace,
+    struct predicate_instance* predicate_list 
+) {
+  u32 predicate_count = 0;
+  u32 i;
+
+  // 遍历所有可能的指令ID
+  for (i = 0; i < INST_SIZE; i++) {
+    // 只处理在本次崩溃路径中被访问过的指令
+    if (current_trace->is_visited[i] == 0) continue;
+
+    // --- 数据流事实 ---
+    // 记录下观察到的精确运行时值。
+    // 同时生成LEQ和GT来精确表示“等于”这个事实。
+    u64 value = current_trace->min_value[i];
+    predicate_list[predicate_count++] = (struct predicate_instance){i, 1, MIN_VAL_LEQ, value};
+    if (value > 0) {
+      predicate_list[predicate_count++] = (struct predicate_instance){i, 1, MAX_VAL_GT, value - 1};
+    }
+    
+    // --- 标志位事实 ---
+    // 记录下每一个被设置的（值为1）的标志位
+    if (current_trace->is_visited[i] & 2) {
+      u64 eflags = current_trace->eflag[i];
+      if (value_of_reg_bit(eflags, 0))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, CARRY_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 2))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, PARITY_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 4))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, ADJUST_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 6))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, ZERO_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 7))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, SIGN_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 8))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, TRAP_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 9))  predicate_list[predicate_count++] = (struct predicate_instance){i, 1, INTERRUPT_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 10)) predicate_list[predicate_count++] = (struct predicate_instance){i, 1, DIRECTION_FLAG_SET, 1};
+      if (value_of_reg_bit(eflags, 11)) predicate_list[predicate_count++] = (struct predicate_instance){i, 1, OVERFLOW_FLAG_SET, 1};
+    }
+  }
+
+  // 遍历所有可能的基本块ID
+  for (i = 1; i < BB_SIZE; i++) {
+    if (current_trace->is_visited[INST_SIZE + i] == 0) continue;
+
+    // --- 控制流事实 ---
+    u16 cnt_succ = current_trace->bb_succ_cnt[i];
+    if (cnt_succ > 0) {
+      u32 start_index = current_trace->bb_start_index[i];
+      // 对于单次执行，只会有一条边
+      u32 edge_to = current_trace->exec_edge_info[start_index];
+      if (edge_to) {
+        // 记录从 BB i 跳转到 BB edge_to
+        predicate_list[predicate_count++] = (struct predicate_instance){i, 0, HAS_EDGE_TO, edge_to};
+      }
+    }
+  }
+  
+  return predicate_count;
+}
+
+
+/* 
+  顶层导出函数：调用特征提取器，并将结果格式化为 JSON 文件。
+*/
+static void dump_all_facts_to_file(const char* out_filename) {
+
+  if (!queue) {
+    WARNF("Queue is empty, cannot dump facts.");
+    return;
+  }
+  // 从队列项中获取崩溃轨迹的原始数据
+  struct exec_info* crash_trace = queue->trace_bits;
+
+  // 分配足够大的空间来存储所有可能的断言
+  struct predicate_instance* pred_list = ck_alloc(sizeof(struct predicate_instance) * (INST_SIZE * 12 + BB_SIZE));
+
+  u32 total_preds = generate_all_predicates_from_trace(crash_trace, pred_list);
+
+  ACTF("Dumping %u detected predicate facts to '%s'...", total_preds, out_filename);
+
+  FILE* f = fopen(out_filename, "w");
+  if (!f) PFATAL("Unable to create dump file '%s'", out_filename);
+  
+  fprintf(f, "{\n");
+  fprintf(f, "  \"crash_sample_path\": \"%s\",\n", queue->fname);
+  fprintf(f, "  \"total_predicates\": %u,\n", total_preds);
+  fprintf(f, "  \"predicates\": [\n");
+
+  for (u32 i = 0; i < total_preds; i++) {
+    struct predicate_instance p = pred_list[i];
+
+    fprintf(f, "    {\n");
+    if (p.is_inst) {
+      fprintf(f, "      \"id_type\": \"Instruction\",\n");
+      fprintf(f, "      \"id\": %u,\n", p.id);
+      fprintf(f, "      \"location\": \"%s\",\n", global_inst_source_info[p.id].sourceCodeInfo);
+      fprintf(f, "      \"assembly\": \"%s\",\n", global_inst_source_info[p.id].instructionInfo);
+    } else {
+      u32 source_bb_id = p.id;
+      u32 target_bb_id = (u32)p.boundary;
+      fprintf(f, "      \"id_type\": \"BasicBlockEdge\",\n");
+      fprintf(f, "      \"source_bb_id\": %u,\n", source_bb_id);
+      fprintf(f, "      \"source_location\": \"%s\",\n", global_bb_source_info[source_bb_id].BBstartSourceCodeInfo);
+      fprintf(f, "      \"target_bb_id\": %u,\n", target_bb_id);
+      fprintf(f, "      \"target_location\": \"%s\",\n", global_bb_source_info[target_bb_id].BBstartSourceCodeInfo);
+    }
+    fprintf(f, "      \"type\": \"%s\",\n", predicateToString(p.type));
+    fprintf(f, "      \"boundary_value\": \"%llu\"\n", p.boundary);
+    fprintf(f, "    }");
+
+    if (i < total_preds - 1) {
+      fprintf(f, ",\n");
+    } else {
+      fprintf(f, "\n");
+    }
+  }
+
+  fprintf(f, "  ]\n}\n");
+
+  fclose(f);
+  ck_free(pred_list);
+  OKF("Predicate facts dump completed successfully.");
+}
+
+// ===================================================================
+// END OF ANAYZE ONCE MODE
+// ===================================================================
+
+
 /* Perform dry run of all test cases to confirm that the app is working as
    expected. This is done only for the initial inputs, and only once. */
 
@@ -4577,6 +4722,22 @@ static void perform_dry_run(char **argv) {
       close(fd);
       add_to_global_values(1);
       update_value_bitmap_score(q);
+
+      // ===================================================================
+      // START OF ANAYZE ONCE MODE
+      // ===================================================================
+
+      // If we are in analyze-once mode, call our dump function and exit.
+      char *analyze_once_outpath = getenv("ANALYZE_ONCE_OUTPATH");
+      if (analyze_once_outpath) {
+        dump_all_facts_to_file(analyze_once_outpath);
+        OKF("Single-run analysis complete. Exiting.");
+        exit(0);
+      }
+
+      // ===================================================================
+      // END OF ANAYZE ONCE MODE
+      // ===================================================================
     }
 
     ck_free(use_mem);
