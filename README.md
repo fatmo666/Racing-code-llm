@@ -1,3 +1,28 @@
+# Racing-LLM
+## Evaluate Cases 21 and 22 / Evaluate Examples 21 and 22
+
+
+- Step 1: Set up and run the Docker environment (as introduced below).
+- Step 2: Compile InstTracer, AFL, and LLVM Passes (as introduced below).
+- Step 3: Change directory into example 21 or 22, and run:
+    *   `./01_build_trace.sh`
+    *   `./02_PoCExecutionInspector.sh`
+    *   `./03_build_fuzz.sh`
+- Step 4: Set the `$GEMINI_API_KEY` environment variable and run `./llm_rca_top_k.sh`.
+- Step 5: The result will be written to `./analysis_reports_manual/gemini_rca_report.json`.
+
+## Evaluate ezXML Zero-Day Simulation
+
+- Step 1: Set up and run the Docker environment (as introduced below).
+- Step 2: Compile InstTracer, AFL, and LLVM Passes (as introduced below).
+- Step 3: Change directory into example 21 or 22, and run `./01_build_trace.sh`.
+- Step 4: Copy the content of `ezxml_zero.c` and **overwrite** `./ezxml/ezxml.c`.
+- Step 5: Run:
+    *   `./02_PoCExecutionInspector.sh`
+    *   `./03_build_fuzz.sh`
+- Step 6: Set the `$GEMINI_API_KEY` environment variable and run `./llm_rca_top_k.sh`.
+- Step 7: The result will be written to `./analysis_reports_manual/gemini_rca_report.json`.
+
 # Racing on the Negative Force: Efficient Vulnerability Root-Cause Analysis through Reinforcement Learning on Counterexamples
 
 Racing is an efficient statistical Root-Cause Analysis (RCA) solution that employs reinforcement learning. This repository contains the proof-of-concept implementation of our [paper](https://www.usenix.org/conference/usenixsecurity24/presentation/xu).
